@@ -186,3 +186,51 @@ def fail_request(request_id: int, attempt: int, error: str) -> bool:
         stage="Failed", error_message=error[:1000],
     )
 
+def recover_stalled_requests() -> dict:
+
+    now = timezone.now()
+    stall_cutoff = now - timedelta(seconds=settings.STALL_TIMEOUT_SECONDS)
+    redispatch_cutoff = now - timedelta(seconds=settings.REDISPATCH_AFTER_SECONDS)
+    requeued = failed = redispatched = 0
+
+    stalled_ids = list(
+        ServiceRequest.objects.filter(status=Status.PROCESSING, last_heartbeat__lt=stall_cutoff)
+        .values_list("pk", flat=True)
+    )
+    for pk in stalled_ids:
+        with transaction.atomic():
+            req = ServiceRequest.objects.select_for_update().get(pk=pk)
+
+            if req.status != Status.PROCESSING or req.last_heartbeat >= stall_cutoff:
+                continue
+            if req.retry_count < settings.MAX_PROCESSING_RETRIES:
+                req.status, req.progress = Status.PENDING, 0
+                req.retry_count += 1
+                req.stage = f"Re-queued after stall (retry {req.retry_count})"
+                req.save()
+                _record(req, Status.PROCESSING, Status.PENDING, None, "Worker stalled; re-queued")
+                _dispatch_after_commit(req.pk)
+                requeued += 1
+            else:
+                req.status = Status.FAILED
+                req.stage = "Failed"
+                req.error_message = "Worker stalled and retries were exhausted."
+                req.completed_at = now
+                req.save()
+                _record(req, Status.PROCESSING, Status.FAILED, None, "Retries exhausted")
+                failed += 1
+            _publish(realtime.EVENT_STATUS_CHANGED, req)
+
+    undelivered = ServiceRequest.objects.filter(status=Status.PENDING).filter(
+        Q(enqueued_at__isnull=True, created_at__lt=redispatch_cutoff) | Q(enqueued_at__lt=redispatch_cutoff)
+    ).values_list("pk", flat=True)
+    for pk in list(undelivered):
+        try:
+            dispatch(pk)
+            redispatched += 1
+        except Exception:
+            logger.exception("Could not re-dispatch request %s", pk)
+
+    if requeued or failed or redispatched:
+        logger.warning("Recovery: requeued=%s failed=%s redispatched=%s", requeued, failed, redispatched)
+    return {"requeued": requeued, "failed": failed, "redispatched": redispatched}
